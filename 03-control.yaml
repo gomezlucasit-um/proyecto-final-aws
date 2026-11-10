@@ -1,0 +1,851 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Valheim gestión de servidores, 03 control. Acá tenemos la lógica y no hay servidores:
+  seis Lambdas en Python con el rol LabRole, la HTTP API que usa el panel (listar, iniciar,
+  detener, crear y eliminar servidores), las reglas de EventBridge (eventos del ASG,
+  lifecycle hook, alarma de CloudWatch, archivos nuevos en S3, cambio de estado de los
+  stacks del servidor y el cron de apagado de seguridad) y las colas de mensajes muertos
+  en SQS. Antes hay que levantar los otros dos stacks.
+
+Parameters:
+  Project:
+    Type: String
+    Default: valheim
+  ApiKey:
+    Type: String
+    NoEcho: true
+    MinLength: 16
+    AllowedPattern: "[A-Za-z0-9_-]+"
+    Description: Clave que el panel manda en el header x-api-key. Mínimo 16 caracteres, letras, números, guion o guion bajo.
+  DiscordWebhook:
+    Type: String
+    Default: none
+    Description: URL del webhook que copiamos de Discord para los avisos al grupo (o none si no queremos avisos).
+  IdleMinutes:
+    Type: Number
+    Default: 30
+    Description: Minutos sin jugadores antes de apagar. Este es sólo para los mensajes, el real está en la alarma de cada servidor.
+  SafetyStopSchedule:
+    Type: String
+    Default: "cron(0 7 * * ? *)"
+    Description: Apagado de seguridad diario, en UTC (las 07:00 UTC son las 04:00 en Montevideo).
+  LabRoleName:
+    Type: String
+    Default: LabRole
+    Description: Rol que ya existe en la cuenta y que usan las Lambdas, porque el laboratorio de la UM no nos deja crear roles.
+  EnableLambdaDlq:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Si la creación de las Lambdas falla por permisos de SQS en el rol, poner false.
+  MaxRunningServers:
+    Type: Number
+    Default: 8
+    MinValue: 1
+    MaxValue: 9
+    Description: Cuántos servidores pueden estar encendidos al mismo tiempo. Al llegar al límite la API rechaza el inicio con un 429. El laboratorio de la UM tiene un máximo de 9 instancias a la vez, así que dejamos 8 y nos queda 1 para test. Para mostrar el 429 en la demo se baja a 1.
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90]
+    Description: Días de guardado de los logs de las Lambdas en CloudWatch Logs.
+  ServerTemplateKey:
+    Type: String
+    Default: templates/04-servidor.yaml
+    Description: Ruta en el bucket de mundos donde subimos el 04-servidor.yaml, es la plantilla que usa el botón Nuevo servidor del panel.
+  MaxServers:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    MaxValue: 50
+    Description: Cuántos servidores pueden existir creados (stacks valheim-srv-*), estén encendidos o no. El tope de 50 es la cuota de NLB por región, uno por servidor.
+
+Conditions:
+  UseLambdaDlq: !Equals [!Ref EnableLambdaDlq, "true"]
+
+Resources:
+  # ---------- Logs de las Lambdas: es un grupo para cada una, con la retención que definimos arriba ----------
+  ApiHandlerLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/${Project}/lambda/api-handler"
+      RetentionInDays: !Ref LogRetentionDays
+  StateSyncLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/${Project}/lambda/state-sync"
+      RetentionInDays: !Ref LogRetentionDays
+  IdleStopLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/${Project}/lambda/idle-stop"
+      RetentionInDays: !Ref LogRetentionDays
+  GracefulShutdownLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/${Project}/lambda/graceful-shutdown"
+      RetentionInDays: !Ref LogRetentionDays
+  BackupRegistrarLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/${Project}/lambda/backup-registrar"
+      RetentionInDays: !Ref LogRetentionDays
+  ProvisionerLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/${Project}/lambda/provisioner"
+      RetentionInDays: !Ref LogRetentionDays
+
+  # ---------- Colas de mensajes muertos ----------
+  EventsDlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${Project}-eventbridge-dlq"
+      MessageRetentionPeriod: 1209600
+      Tags:
+        - { Key: owner:team, Value: grupo-valheim }
+
+  LambdaDlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${Project}-lambda-dlq"
+      MessageRetentionPeriod: 1209600
+      Tags:
+        - { Key: owner:team, Value: grupo-valheim }
+
+  EventsDlqPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref EventsDlq]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: events.amazonaws.com }
+            Action: sqs:SendMessage
+            Resource: !GetAtt EventsDlq.Arn
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/${Project}-*"
+
+  # ---------- Lambdas ----------
+  ApiHandler:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${Project}-api-handler"
+      Description: Lista los servidores y los prende o apaga cambiando la capacidad deseada del ASG.
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !Sub "arn:aws:iam::${AWS::AccountId}:role/${LabRoleName}"
+      LoggingConfig:
+        LogGroup: !Ref ApiHandlerLogs
+        LogFormat: Text
+      Timeout: 20
+      MemorySize: 256
+      DeadLetterConfig: !If [UseLambdaDlq, { TargetArn: !GetAtt LambdaDlq.Arn }, !Ref "AWS::NoValue"]
+      Environment:
+        Variables:
+          TABLE:
+            Fn::ImportValue: !Sub "${Project}-TableName"
+          API_KEY: !Ref ApiKey
+          MAX_RUNNING: !Ref MaxRunningServers
+      Tags:
+        - { Key: owner:team, Value: grupo-valheim }
+      Code:
+        ZipFile: |
+          import json, os, time, boto3
+          from decimal import Decimal
+          asg = boto3.client('autoscaling')
+          tb = boto3.resource('dynamodb').Table(os.environ['TABLE'])
+          KEY = os.environ['API_KEY']
+          MAX_RUNNING = int(os.environ.get('MAX_RUNNING', '2'))
+
+          def groups():
+              out = {}
+              for pg in asg.get_paginator('describe_auto_scaling_groups').paginate():
+                  for g in pg['AutoScalingGroups']:
+                      t = {x['Key']: x['Value'] for x in g.get('Tags', [])}
+                      if 'valheim:server' in t:
+                          out[t['valheim:server']] = (g, t)
+              return out
+
+          def clean(o):
+              if isinstance(o, list): return [clean(x) for x in o]
+              if isinstance(o, dict): return {k: clean(v) for k, v in o.items()}
+              if isinstance(o, Decimal): return int(o) if o == int(o) else float(o)
+              return o
+
+          def resp(code, body):
+              return {'statusCode': code, 'headers': {'Content-Type': 'application/json'},
+                      'body': json.dumps(clean(body), ensure_ascii=False)}
+
+          def handler(e, c):
+              h = {k.lower(): v for k, v in (e.get('headers') or {}).items()}
+              if h.get('x-api-key') != KEY:
+                  return resp(401, {'error': 'clave invalida'})
+              m = e['requestContext']['http']['method']
+              p = e.get('rawPath', '')
+              name = (e.get('pathParameters') or {}).get('name')
+              gs = groups()
+              if m == 'GET' and p.endswith('/servers'):
+                  out = []; st = {i['PK'][7:]: i for i in tb.scan(IndexName='ByStatus')['Items']}
+                  for n, (g, t) in sorted(gs.items()):
+                      s = st.pop(n, {})
+                      out.append({'name': n, 'world': t.get('valheim:world'), 'desired': g['DesiredCapacity'],
+                                  'instances': len(g['Instances']), 'status': s.get('status', 'STOPPED'),
+                                  'address': s.get('address'), 'players': s.get('players', 0),
+                                  'updated': s.get('updated'), 'lastBackup': s.get('lastBackup')})
+                  for n, s in sorted(st.items()):  # stacks en creacion / eliminacion / fallidos (sin ASG todavia)
+                      if s.get('status') in ('CREATING', 'DELETING', 'ERROR'):
+                          out.append({'name': n, 'world': s.get('world'), 'desired': 0, 'instances': 0, 'status': s['status'],
+                                      'players': 0, 'updated': s.get('updated'), 'error': s.get('error'), 'noAsg': True})
+                  return resp(200, out)
+              if name not in gs:
+                  return resp(404, {'error': 'servidor no encontrado'})
+              g, t = gs[name]
+              if m == 'GET' and p.endswith('/events'):
+                  r = tb.query(KeyConditionExpression='PK = :p AND begins_with(SK, :e)',
+                               ExpressionAttributeValues={':p': 'SERVER#' + name, ':e': 'EVENT#'},
+                               ScanIndexForward=False, Limit=25)
+                  return resp(200, r['Items'])
+              if m == 'POST' and p.endswith('/start'): d, st = 1, 'STARTING'
+              elif m == 'POST' and p.endswith('/stop'): d, st = 0, 'STOPPING'
+              else: return resp(400, {'error': 'ruta no soportada'})
+              if g['DesiredCapacity'] == d:
+                  return resp(200, {'name': name, 'status': st, 'note': 'sin cambios'})
+              if d == 1 and g['Instances']:
+                  return resp(409, {'error': 'el servidor anterior todavia se esta apagando; esperar a STOPPED'})
+              if d == 1 and sum(1 for x, _ in gs.values() if x['DesiredCapacity'] > 0) >= MAX_RUNNING:
+                  return resp(429, {'error': 'limite de %d servidores encendidos alcanzado; apagar otro primero' % MAX_RUNNING})
+              asg.set_desired_capacity(AutoScalingGroupName=g['AutoScalingGroupName'], DesiredCapacity=d, HonorCooldown=False)
+              now = int(time.time())
+              tb.update_item(Key={'PK': 'SERVER#' + name, 'SK': 'STATE'}, UpdateExpression='SET #s = :s, updated = :u',
+                             ExpressionAttributeNames={'#s': 'status'}, ExpressionAttributeValues={':s': st, ':u': now})
+              tb.put_item(Item={'PK': 'SERVER#' + name, 'SK': 'EVENT#%d' % (time.time() * 1000), 'kind': st.lower(),
+                                'detail': 'solicitado desde el panel', 'ts': now})
+              return resp(200, {'name': name, 'status': st})
+
+  StateSync:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${Project}-state-sync"
+      Description: Escucha los eventos del ASG (instancia lanzada o terminada) y de los stacks del servidor (creado, eliminado o fallido), actualiza DynamoDB y avisa por Discord.
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !Sub "arn:aws:iam::${AWS::AccountId}:role/${LabRoleName}"
+      LoggingConfig:
+        LogGroup: !Ref StateSyncLogs
+        LogFormat: Text
+      Timeout: 20
+      MemorySize: 128
+      DeadLetterConfig: !If [UseLambdaDlq, { TargetArn: !GetAtt LambdaDlq.Arn }, !Ref "AWS::NoValue"]
+      Environment:
+        Variables:
+          TABLE:
+            Fn::ImportValue: !Sub "${Project}-TableName"
+          WEBHOOK: !Ref DiscordWebhook
+          STACK_PREFIX: !Sub "${Project}-srv-"
+      Tags:
+        - { Key: owner:team, Value: grupo-valheim }
+      Code:
+        ZipFile: |
+          import json, os, time, boto3, urllib.request
+          asg = boto3.client('autoscaling')
+          tb = boto3.resource('dynamodb').Table(os.environ['TABLE'])
+          WH = os.environ.get('WEBHOOK', ''); PFX = os.environ.get('STACK_PREFIX', 'valheim-srv-')
+
+          def discord(msg):
+              if not WH.startswith('http'): return
+              try:
+                  req = urllib.request.Request(WH, data=json.dumps({'content': msg}).encode(),
+                                               headers={'Content-Type': 'application/json', 'User-Agent': 'valheim-manager/1.0'})
+                  urllib.request.urlopen(req, timeout=5)
+              except Exception as ex:
+                  print('discord:', ex)
+
+          def stack_event(d):
+              sid = d.get('stack-id', ''); sn = sid.split('/')[1] if sid.count('/') >= 1 else ''
+              if not sn.startswith(PFX): return
+              name = sn[len(PFX):]; sd = d.get('status-details', {})
+              st = sd.get('status', ''); why = (sd.get('status-reason') or '')[:300]
+              k = {'PK': 'SERVER#' + name, 'SK': 'STATE'}
+              it = tb.get_item(Key=k).get('Item', {}); cur = it.get('status')
+              if st == 'CREATE_IN_PROGRESS':
+                  discord('[%s] estamos creando el servidor (mundo %s), en unos 3 minutos queda listo para prender.' % (name, it.get('world', '?')))
+              elif st == 'DELETE_IN_PROGRESS' and cur == 'DELETING':
+                  discord('[%s] estamos eliminando el servidor, el mundo queda guardado en S3 (worlds/%s/).' % (name, name))
+              elif st == 'CREATE_COMPLETE':
+                  put(name, 'STOPPED', {'stack': sn, 'players': 0})
+                  discord('[%s] servidor creado, ya se puede prender desde el panel.' % name)
+              elif st in ('CREATE_FAILED', 'ROLLBACK_IN_PROGRESS', 'ROLLBACK_COMPLETE', 'DELETE_FAILED') or (st == 'DELETE_IN_PROGRESS' and cur == 'CREATING'):
+                  put(name, 'ERROR', {'error': why or st})
+                  discord('[%s] falló la creación del servidor: %s' % (name, (why or st)[:200]))
+              elif st == 'DELETE_COMPLETE' and cur == 'DELETING':
+                  tb.delete_item(Key=k)
+                  tb.put_item(Item={'PK': 'SERVER#' + name, 'SK': 'EVENT#%d' % (time.time() * 1000), 'kind': 'deleted',
+                                    'detail': 'stack %s eliminado' % sn, 'ts': int(time.time())})
+                  discord('[%s] servidor eliminado, el mundo sigue guardado en S3.' % name)
+
+          def server_of(asg_name):
+              g = asg.describe_auto_scaling_groups(AutoScalingGroupNames=[asg_name])['AutoScalingGroups']
+              return {t['Key']: t['Value'] for t in g[0]['Tags']}.get('valheim:server') if g else None
+
+          def put(name, st, extra):
+              n = int(time.time())
+              names, vals, ex = {'#s': 'status'}, {':s': st, ':u': n}, ''
+              for k, v in extra.items():
+                  names['#' + k] = k; vals[':' + k] = v; ex += ', #%s = :%s' % (k, k)
+              tb.update_item(Key={'PK': 'SERVER#' + name, 'SK': 'STATE'}, UpdateExpression='SET #s = :s, updated = :u' + ex,
+                             ExpressionAttributeNames=names, ExpressionAttributeValues=vals)
+              tb.put_item(Item={'PK': 'SERVER#' + name, 'SK': 'EVENT#%d' % (time.time() * 1000), 'kind': st.lower(),
+                                'detail': json.dumps(extra), 'ts': n})
+
+          def handler(e, c):
+              d = e.get('detail', {}); dt = e.get('detail-type', '')
+              if e.get('source') == 'aws.cloudformation': return stack_event(d)
+              name = server_of(d.get('AutoScalingGroupName', ''))
+              if not name: return
+              i = d.get('EC2InstanceId', '')
+              if dt == 'EC2 Instance Launch Successful':
+                  put(name, 'STARTING', {'instance': i})
+                  discord('[%s] se lanzó la instancia %s, el servidor está arrancando (2 a 4 min).' % (name, i))
+              elif dt == 'EC2 Instance Terminate Successful':
+                  put(name, 'STOPPED', {'instance': '-', 'players': 0})
+                  discord('[%s] servidor apagado, el mundo quedó guardado en S3.' % name)
+              elif dt == 'EC2 Instance Launch Unsuccessful':
+                  put(name, 'ERROR', {'cause': d.get('Cause', '')[:300]})
+                  discord('[%s] falló el lanzamiento de la instancia: %s' % (name, d.get('Cause', '')[:200]))
+
+  IdleStop:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${Project}-idle-stop"
+      Description: Apaga el servidor cuando la alarma de CloudWatch avisa que no hay jugadores, o apaga todos los encendidos cuando corre el cron de seguridad.
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !Sub "arn:aws:iam::${AWS::AccountId}:role/${LabRoleName}"
+      LoggingConfig:
+        LogGroup: !Ref IdleStopLogs
+        LogFormat: Text
+      Timeout: 30
+      MemorySize: 128
+      DeadLetterConfig: !If [UseLambdaDlq, { TargetArn: !GetAtt LambdaDlq.Arn }, !Ref "AWS::NoValue"]
+      Environment:
+        Variables:
+          TABLE:
+            Fn::ImportValue: !Sub "${Project}-TableName"
+          WEBHOOK: !Ref DiscordWebhook
+          IDLE_MINUTES: !Ref IdleMinutes
+      Tags:
+        - { Key: owner:team, Value: grupo-valheim }
+      Code:
+        ZipFile: |
+          import json, os, time, boto3, urllib.request
+          asg = boto3.client('autoscaling')
+          tb = boto3.resource('dynamodb').Table(os.environ['TABLE'])
+          WH = os.environ.get('WEBHOOK', ''); IDLE = os.environ.get('IDLE_MINUTES', '30')
+
+          def discord(msg):
+              if not WH.startswith('http'): return
+              try:
+                  req = urllib.request.Request(WH, data=json.dumps({'content': msg}).encode(),
+                                               headers={'Content-Type': 'application/json', 'User-Agent': 'valheim-manager/1.0'})
+                  urllib.request.urlopen(req, timeout=5)
+              except Exception as ex:
+                  print('discord:', ex)
+
+          def groups():
+              out = {}
+              for pg in asg.get_paginator('describe_auto_scaling_groups').paginate():
+                  for g in pg['AutoScalingGroups']:
+                      t = {x['Key']: x['Value'] for x in g.get('Tags', [])}
+                      if 'valheim:server' in t: out[t['valheim:server']] = g
+              return out
+
+          def handler(e, c):
+              gs = groups(); targets = []
+              reason = 'apagado de seguridad programado de la madrugada'
+              if e.get('source') == 'aws.cloudwatch':
+                  d = e.get('detail', {})
+                  if d.get('state', {}).get('value') != 'ALARM': return
+                  try:
+                      name = d['configuration']['metrics'][0]['metricStat']['metric']['dimensions']['Server']
+                  except Exception:
+                      name = d.get('alarmName', '').replace('valheim-', '').replace('-idle', '')
+                  reason = 'sin jugadores durante %s minutos' % IDLE
+                  targets = [name] if name in gs else []
+              else:
+                  targets = [n for n, g in gs.items() if g['DesiredCapacity'] > 0]
+              done = []
+              for n in targets:
+                  g = gs[n]
+                  if g['DesiredCapacity'] == 0: continue
+                  asg.set_desired_capacity(AutoScalingGroupName=g['AutoScalingGroupName'], DesiredCapacity=0, HonorCooldown=False)
+                  now = int(time.time())
+                  tb.update_item(Key={'PK': 'SERVER#' + n, 'SK': 'STATE'}, UpdateExpression='SET #s = :s, updated = :u',
+                                 ExpressionAttributeNames={'#s': 'status'}, ExpressionAttributeValues={':s': 'STOPPING', ':u': now})
+                  tb.put_item(Item={'PK': 'SERVER#' + n, 'SK': 'EVENT#%d' % (time.time() * 1000), 'kind': 'idle-stop', 'detail': reason, 'ts': now})
+                  discord('[%s] apagando: %s.' % (n, reason)); done.append(n)
+              return {'stopped': done}
+
+  GracefulShutdown:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${Project}-graceful-shutdown"
+      Description: Cuando el ASG va a terminar una instancia, le manda por SSM la orden de guardar el mundo y subirlo a S3 antes de dejarla terminar.
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !Sub "arn:aws:iam::${AWS::AccountId}:role/${LabRoleName}"
+      LoggingConfig:
+        LogGroup: !Ref GracefulShutdownLogs
+        LogFormat: Text
+      Timeout: 30
+      MemorySize: 128
+      DeadLetterConfig: !If [UseLambdaDlq, { TargetArn: !GetAtt LambdaDlq.Arn }, !Ref "AWS::NoValue"]
+      Environment:
+        Variables:
+          TABLE:
+            Fn::ImportValue: !Sub "${Project}-TableName"
+      Tags:
+        - { Key: owner:team, Value: grupo-valheim }
+      Code:
+        ZipFile: |
+          import json, os, time, boto3
+          asg = boto3.client('autoscaling'); ssm = boto3.client('ssm')
+          tb = boto3.resource('dynamodb').Table(os.environ['TABLE'])
+
+          def server_of(asg_name):
+              g = asg.describe_auto_scaling_groups(AutoScalingGroupNames=[asg_name])['AutoScalingGroups']
+              return {t['Key']: t['Value'] for t in g[0]['Tags']}.get('valheim:server') if g else None
+
+          def handler(e, c):
+              d = e['detail']
+              i, hook, g, tok = d['EC2InstanceId'], d['LifecycleHookName'], d['AutoScalingGroupName'], d['LifecycleActionToken']
+              name = server_of(g)
+              if not name:
+                  asg.complete_lifecycle_action(LifecycleHookName=hook, AutoScalingGroupName=g,
+                                                LifecycleActionToken=tok, LifecycleActionResult='CONTINUE')
+                  return
+              now = int(time.time())
+              tb.update_item(Key={'PK': 'SERVER#' + name, 'SK': 'STATE'}, UpdateExpression='SET #s = :s, updated = :u',
+                             ExpressionAttributeNames={'#s': 'status'}, ExpressionAttributeValues={':s': 'STOPPING', ':u': now})
+              cmd = '/opt/valheim/shutdown.sh "%s" "%s" "%s"' % (hook, g, tok)
+              try:
+                  r = ssm.send_command(InstanceIds=[i], DocumentName='AWS-RunShellScript',
+                                       Parameters={'commands': [cmd], 'executionTimeout': ['540']},
+                                       TimeoutSeconds=60, Comment='valheim graceful shutdown')
+                  detail = 'Run Command %s enviado a %s' % (r['Command']['CommandId'], i)
+              except Exception as ex:
+                  detail = 'no se pudo enviar Run Command (%s); se completa el hook sin guardar' % str(ex)[:200]
+                  asg.complete_lifecycle_action(LifecycleHookName=hook, AutoScalingGroupName=g,
+                                                LifecycleActionToken=tok, LifecycleActionResult='CONTINUE')
+              tb.put_item(Item={'PK': 'SERVER#' + name, 'SK': 'EVENT#%d' % (time.time() * 1000), 'kind': 'shutdown', 'detail': detail, 'ts': now})
+
+  BackupRegistrar:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${Project}-backup-registrar"
+      Description: Anota en DynamoDB cada backup que llega al bucket de mundos.
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !Sub "arn:aws:iam::${AWS::AccountId}:role/${LabRoleName}"
+      LoggingConfig:
+        LogGroup: !Ref BackupRegistrarLogs
+        LogFormat: Text
+      Timeout: 10
+      MemorySize: 128
+      DeadLetterConfig: !If [UseLambdaDlq, { TargetArn: !GetAtt LambdaDlq.Arn }, !Ref "AWS::NoValue"]
+      Environment:
+        Variables:
+          TABLE:
+            Fn::ImportValue: !Sub "${Project}-TableName"
+      Tags:
+        - { Key: owner:team, Value: grupo-valheim }
+      Code:
+        ZipFile: |
+          import os, time, boto3
+          tb = boto3.resource('dynamodb').Table(os.environ['TABLE'])
+
+          def handler(e, c):
+              o = e.get('detail', {}).get('object', {})
+              key = o.get('key', ''); size = int(o.get('size', 0) or 0)
+              parts = key.split('/')
+              if len(parts) < 3 or parts[0] not in ('backups', 'worlds'): return
+              kind, name, now = parts[0], parts[1], int(time.time())
+              k = {'PK': 'SERVER#' + name, 'SK': 'STATE'}
+              if kind == 'backups':
+                  tb.put_item(Item={'PK': 'SERVER#' + name, 'SK': 'EVENT#%d' % (time.time() * 1000), 'kind': 'backup',
+                                    'detail': key, 'size': size, 'ts': now})
+                  tb.update_item(Key=k, UpdateExpression='SET lastBackup = :k, lastBackupTs = :t',
+                                 ExpressionAttributeValues={':k': key, ':t': now})
+              elif key.endswith('.db'):
+                  tb.update_item(Key=k, UpdateExpression='SET lastSave = :k, lastSaveTs = :t',
+                                 ExpressionAttributeValues={':k': key, ':t': now})
+
+  Provisioner:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${Project}-provisioner"
+      Description: Crea (POST /servers) y elimina (DELETE /servers/{name}) los stacks del servidor con CloudFormation, usando el 04-servidor.yaml que está en S3.
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !Sub "arn:aws:iam::${AWS::AccountId}:role/${LabRoleName}"
+      LoggingConfig:
+        LogGroup: !Ref ProvisionerLogs
+        LogFormat: Text
+      Timeout: 25
+      MemorySize: 256
+      DeadLetterConfig: !If [UseLambdaDlq, { TargetArn: !GetAtt LambdaDlq.Arn }, !Ref "AWS::NoValue"]
+      Environment:
+        Variables:
+          TABLE:
+            Fn::ImportValue: !Sub "${Project}-TableName"
+          API_KEY: !Ref ApiKey
+          WEBHOOK: !Ref DiscordWebhook
+          PROJECT: !Ref Project
+          STACK_PREFIX: !Sub "${Project}-srv-"
+          MAX_SERVERS: !Ref MaxServers
+          TEMPLATE_URL: !Sub
+            - "https://${Bucket}.s3.${AWS::Region}.amazonaws.com/${ServerTemplateKey}"
+            - Bucket:
+                Fn::ImportValue: !Sub "${Project}-WorldsBucket"
+      Tags:
+        - { Key: owner:team, Value: grupo-valheim }
+      Code:
+        ZipFile: |
+          import json, os, re, time, boto3
+          cfn = boto3.client('cloudformation'); asg = boto3.client('autoscaling')
+          tb = boto3.resource('dynamodb').Table(os.environ['TABLE'])
+          E = os.environ; KEY = E['API_KEY']; PRJ = E.get('PROJECT', 'valheim'); PFX = E.get('STACK_PREFIX', 'valheim-srv-')
+          MAXS = int(E.get('MAX_SERVERS', '4')); TYPES = ('t3.large', 't3a.large', 'm5.large', 't3.medium'); NAME = r'[a-z][a-z0-9-]{2,17}'
+
+          def resp(c, b):
+              return {'statusCode': c, 'headers': {'Content-Type': 'application/json'}, 'body': json.dumps(b, ensure_ascii=False)}
+
+          def event(name, kind, detail):
+              now = int(time.time())
+              tb.put_item(Item={'PK': 'SERVER#' + name, 'SK': 'EVENT#%d' % (time.time() * 1000), 'kind': kind, 'detail': detail, 'ts': now})
+              return now
+
+          def stacks():
+              return {s['StackName']: s for s in cfn.describe_stacks()['Stacks']}
+
+          def handler(e, c):
+              h = {k.lower(): v for k, v in (e.get('headers') or {}).items()}
+              if h.get('x-api-key') != KEY: return resp(401, {'error': 'clave invalida'})
+              m = e['requestContext']['http']['method']
+              if m == 'POST': return create(e)
+              if m == 'DELETE': return delete((e.get('pathParameters') or {}).get('name', ''))
+              return resp(400, {'error': 'ruta no soportada'})
+
+          def create(e):
+              try: b = json.loads(e.get('body') or '{}')
+              except Exception: return resp(400, {'error': 'JSON invalido'})
+              name = str(b.get('name', '')).strip().lower(); world = str(b.get('world') or 'Midgard').strip()
+              pw = str(b.get('password', '')); it = str(b.get('instanceType') or 't3.large')
+              if not re.fullmatch(NAME, name): return resp(400, {'error': 'nombre: 3 a 18 caracteres (a-z, 0-9, guion), empieza con letra'})
+              if not re.fullmatch(r'[A-Za-z0-9_-]{3,20}', world): return resp(400, {'error': 'mundo: 3 a 20 caracteres (letras, numeros, _ o -)'})
+              if not 5 <= len(pw) <= 30 or pw.lower() in name: return resp(400, {'error': 'contrasena: 5 a 30 caracteres y no contenida en el nombre'})
+              if it not in TYPES: return resp(400, {'error': 'tipo de instancia no permitido'})
+              sn = PFX + name; ss = stacks()
+              if sn in ss: return resp(409, {'error': 'ya existe un servidor con ese nombre'})
+              if sum(1 for n in ss if n.startswith(PFX)) >= MAXS: return resp(429, {'error': 'limite de %d servidores creados; eliminar otro primero' % MAXS})
+              ps = {'ServerName': name, 'WorldName': world, 'ServerPassword': pw, 'InstanceType': it, 'DiscordWebhook': E.get('WEBHOOK') or 'none'}
+              cfn.create_stack(StackName=sn, TemplateURL=E['TEMPLATE_URL'], OnFailure='DELETE', Tags=[{'Key': 'owner:team', 'Value': 'grupo-valheim'}],
+                               Parameters=[{'ParameterKey': k, 'ParameterValue': v} for k, v in ps.items()])
+              now = event(name, 'creating', 'stack %s pedido desde el panel (%s, mundo %s)' % (sn, it, world))
+              tb.put_item(Item={'PK': 'SERVER#' + name, 'SK': 'STATE', 'status': 'CREATING', 'updated': now, 'world': world, 'instanceType': it, 'stack': sn, 'players': 0})
+              return resp(202, {'name': name, 'status': 'CREATING', 'stack': sn})
+
+          def delete(name):
+              if not re.fullmatch(NAME, name): return resp(400, {'error': 'nombre invalido'})
+              sn = PFX + name; s = stacks().get(sn); k = {'PK': 'SERVER#' + name, 'SK': 'STATE'}
+              if not s:
+                  tb.delete_item(Key=k); return resp(200, {'name': name, 'status': 'DELETED'})
+              g = asg.describe_auto_scaling_groups(AutoScalingGroupNames=[PRJ + '-' + name])['AutoScalingGroups']
+              if g and (g[0]['DesiredCapacity'] > 0 or g[0]['Instances']): return resp(409, {'error': 'el servidor esta encendido o apagandose; esperar a Apagado'})
+              if s['StackStatus'].endswith('_IN_PROGRESS'): return resp(409, {'error': 'el stack esta en %s; esperar' % s['StackStatus']})
+              cfn.delete_stack(StackName=sn)
+              now = event(name, 'deleting', 'stack %s eliminandose desde el panel' % sn)
+              tb.update_item(Key=k, UpdateExpression='SET #s = :s, updated = :u', ExpressionAttributeNames={'#s': 'status'}, ExpressionAttributeValues={':s': 'DELETING', ':u': now})
+              return resp(202, {'name': name, 'status': 'DELETING'})
+
+  # ---------- Dashboard de CloudWatch (hasta 3 son gratis) ----------
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "${Project}-manager"
+      DashboardBody: !Sub |
+        {"widgets": [
+          {"type": "metric", "x": 0, "y": 0, "width": 12, "height": 6, "properties": {"title": "Jugadores conectados por servidor", "region": "${AWS::Region}", "view": "timeSeries", "stat": "Maximum", "period": 60,
+            "metrics": [[{"expression": "SEARCH('{Valheim,Server} MetricName=\"PlayersOnline\"', 'Maximum', 60)", "id": "p"}]]}},
+          {"type": "metric", "x": 12, "y": 0, "width": 12, "height": 6, "properties": {"title": "Instancias en servicio por ASG", "region": "${AWS::Region}", "view": "timeSeries", "stat": "Maximum", "period": 60,
+            "metrics": [[{"expression": "SEARCH('{AWS/AutoScaling,AutoScalingGroupName} MetricName=\"GroupInServiceInstances\" ${Project}', 'Maximum', 60)", "id": "i"}]]}},
+          {"type": "metric", "x": 0, "y": 6, "width": 12, "height": 6, "properties": {"title": "CPU de los servidores (%)", "region": "${AWS::Region}", "view": "timeSeries", "stat": "Average", "period": 60,
+            "metrics": [[{"expression": "SEARCH('{AWS/EC2,AutoScalingGroupName} MetricName=\"CPUUtilization\" ${Project}', 'Average', 60)", "id": "c"}]]}},
+          {"type": "metric", "x": 12, "y": 6, "width": 12, "height": 6, "properties": {"title": "Errores e invocaciones de las Lambdas", "region": "${AWS::Region}", "view": "timeSeries", "stat": "Sum", "period": 300,
+            "metrics": [[{"expression": "SEARCH('{AWS/Lambda,FunctionName} MetricName=\"Errors\" ${Project}', 'Sum', 300)", "id": "e"}],
+                        [{"expression": "SEARCH('{AWS/Lambda,FunctionName} MetricName=\"Invocations\" ${Project}', 'Sum', 300)", "id": "n"}]]}}
+        ]}
+
+  # ---------- HTTP API para el panel ----------
+  Api:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub "${Project}-api"
+      ProtocolType: HTTP
+      Description: API que usa el panel web.
+      CorsConfiguration:
+        AllowOrigins: ["*"]
+        AllowMethods: [GET, POST, DELETE, OPTIONS]
+        AllowHeaders: [content-type, x-api-key]
+        MaxAge: 3600
+
+  ApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref Api
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt ApiHandler.Arn
+      PayloadFormatVersion: "2.0"
+
+  ProvisionerIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref Api
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt Provisioner.Arn
+      PayloadFormatVersion: "2.0"
+
+  RouteCreateServer:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref Api
+      RouteKey: "POST /servers"
+      Target: !Sub "integrations/${ProvisionerIntegration}"
+
+  RouteDeleteServer:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref Api
+      RouteKey: "DELETE /servers/{name}"
+      Target: !Sub "integrations/${ProvisionerIntegration}"
+
+  RouteListServers:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref Api
+      RouteKey: "GET /servers"
+      Target: !Sub "integrations/${ApiIntegration}"
+
+  RouteEvents:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref Api
+      RouteKey: "GET /servers/{name}/events"
+      Target: !Sub "integrations/${ApiIntegration}"
+
+  RouteStart:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref Api
+      RouteKey: "POST /servers/{name}/start"
+      Target: !Sub "integrations/${ApiIntegration}"
+
+  RouteStop:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref Api
+      RouteKey: "POST /servers/{name}/stop"
+      Target: !Sub "integrations/${ApiIntegration}"
+
+  ApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref Api
+      StageName: "$default"
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 20
+        ThrottlingRateLimit: 10
+
+  ApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ApiHandler
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*"
+
+  ProvisionerInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref Provisioner
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*"
+
+  # ---------- Reglas de EventBridge ----------
+  StackEventsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${Project}-stack-events"
+      Description: Cuando un stack de servidor cambia de estado, avisa a state-sync
+      EventPattern:
+        source: [aws.cloudformation]
+        detail-type: [CloudFormation Stack Status Change]
+        detail:
+          stack-id:
+            - prefix: !Sub "arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${Project}-srv-"
+      Targets:
+        - Id: state-sync-stacks
+          Arn: !GetAtt StateSync.Arn
+          DeadLetterConfig: { Arn: !GetAtt EventsDlq.Arn }
+          RetryPolicy: { MaximumRetryAttempts: 3, MaximumEventAgeInSeconds: 600 }
+
+  StackEventsPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref StateSync
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt StackEventsRule.Arn
+
+  AsgEventsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${Project}-asg-events"
+      Description: Cuando el ASG lanza o termina una instancia, avisa a state-sync
+      EventPattern:
+        source: [aws.autoscaling]
+        detail-type:
+          - EC2 Instance Launch Successful
+          - EC2 Instance Terminate Successful
+          - EC2 Instance Launch Unsuccessful
+      Targets:
+        - Id: state-sync
+          Arn: !GetAtt StateSync.Arn
+          DeadLetterConfig: { Arn: !GetAtt EventsDlq.Arn }
+          RetryPolicy: { MaximumRetryAttempts: 3, MaximumEventAgeInSeconds: 600 }
+
+  AsgEventsPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref StateSync
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt AsgEventsRule.Arn
+
+  LifecycleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${Project}-lifecycle-terminating"
+      Description: Cuando una instancia entra al lifecycle hook de terminación, llama a graceful-shutdown
+      EventPattern:
+        source: [aws.autoscaling]
+        detail-type: [EC2 Instance-terminate Lifecycle Action]
+      Targets:
+        - Id: graceful-shutdown
+          Arn: !GetAtt GracefulShutdown.Arn
+          DeadLetterConfig: { Arn: !GetAtt EventsDlq.Arn }
+          RetryPolicy: { MaximumRetryAttempts: 3, MaximumEventAgeInSeconds: 300 }
+
+  LifecyclePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref GracefulShutdown
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt LifecycleRule.Arn
+
+  AlarmRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${Project}-idle-alarm"
+      Description: Cuando una alarma valheim-*-idle pasa a ALARM, llama a idle-stop
+      EventPattern:
+        source: [aws.cloudwatch]
+        detail-type: [CloudWatch Alarm State Change]
+        detail:
+          alarmName:
+            - prefix: !Sub "${Project}-"
+          state:
+            value: [ALARM]
+      Targets:
+        - Id: idle-stop
+          Arn: !GetAtt IdleStop.Arn
+          DeadLetterConfig: { Arn: !GetAtt EventsDlq.Arn }
+          RetryPolicy: { MaximumRetryAttempts: 3, MaximumEventAgeInSeconds: 600 }
+
+  AlarmPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref IdleStop
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt AlarmRule.Arn
+
+  SafetyStopRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${Project}-safety-stop"
+      Description: Todos los días a las 4 se apagan los servidores si quedaron prendidos
+      ScheduleExpression: !Ref SafetyStopSchedule
+      Targets:
+        - Id: idle-stop-cron
+          Arn: !GetAtt IdleStop.Arn
+          Input: '{"source": "cron"}'
+          DeadLetterConfig: { Arn: !GetAtt EventsDlq.Arn }
+
+  SafetyStopPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref IdleStop
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt SafetyStopRule.Arn
+
+  BackupCreatedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${Project}-backup-created"
+      Description: Cuando entra un archivo nuevo al bucket de mundos, llama a backup-registrar
+      EventPattern:
+        source: [aws.s3]
+        detail-type: [Object Created]
+        detail:
+          bucket:
+            name:
+              - Fn::ImportValue: !Sub "${Project}-WorldsBucket"
+      Targets:
+        - Id: backup-registrar
+          Arn: !GetAtt BackupRegistrar.Arn
+          DeadLetterConfig: { Arn: !GetAtt EventsDlq.Arn }
+          RetryPolicy: { MaximumRetryAttempts: 3, MaximumEventAgeInSeconds: 600 }
+
+  BackupCreatedPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref BackupRegistrar
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt BackupCreatedRule.Arn
+
+Outputs:
+  ApiUrl:
+    Description: Esta URL se pega en el panel, sin la barra final.
+    Value: !Sub "https://${Api}.execute-api.${AWS::Region}.amazonaws.com"
+    Export: { Name: !Sub "${Project}-ApiUrl" }
+  DiscordWebhook:
+    Value: !Ref DiscordWebhook
+    Export: { Name: !Sub "${Project}-DiscordWebhook" }
+  ServerTemplateUrl:
+    Description: Subir acá el 04-servidor.yaml para que funcione el botón Nuevo Servidor.
+    Value: !Sub
+      - "s3://${Bucket}/${ServerTemplateKey}"
+      - Bucket:
+          Fn::ImportValue: !Sub "${Project}-WorldsBucket"
+  EventsDlqUrl:
+    Value: !Ref EventsDlq
+  LambdaDlqUrl:
+    Value: !Ref LambdaDlq

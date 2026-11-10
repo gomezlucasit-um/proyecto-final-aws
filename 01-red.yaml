@@ -1,0 +1,190 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Valheim gestion de servidores, 01 red. Contiene la VPC con sus dos subredes
+  publicas en dos AZ diferentes para mayor redundancia, Internet Gateway, tabla
+  de rutas, asi como los Gateway Endpoints a S3 y DynamoDB (sin NAT Gateway,
+  con trafico privado hacia AWS).
+
+Parameters:
+  Project:
+    Type: String
+    Default: valheim
+    Description: Prefijo de nombres y de exports (dejamos valheim siempre y cuando no haya dos despliegues en la misma cuenta).
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+  Subnet1Cidr:
+    Type: String
+    Default: 10.0.1.0/24
+  Subnet2Cidr:
+    Type: String
+    Default: 10.0.2.0/24
+  PrivateSubnet1Cidr:
+    Type: String
+    Default: 10.0.11.0/24
+  PrivateSubnet2Cidr:
+    Type: String
+    Default: 10.0.12.0/24
+  OwnerTeam:
+    Type: String
+    Default: grupo-valheim
+    Description: Valor del tag owner:team, lo usamos para seguir los costos del grupo.
+
+Resources:
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - { Key: Name, Value: !Sub "${Project}-vpc" }
+        - { Key: owner:team, Value: !Ref OwnerTeam }
+        - { Key: owner:environment, Value: dev }
+        - { Key: cost-center, Value: facultad-aws }
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - { Key: Name, Value: !Sub "${Project}-igw" }
+        - { Key: owner:team, Value: !Ref OwnerTeam }
+
+  VpcGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref Subnet1Cidr
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - { Key: Name, Value: !Sub "${Project}-public-a" }
+        - { Key: owner:team, Value: !Ref OwnerTeam }
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref Subnet2Cidr
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - { Key: Name, Value: !Sub "${Project}-public-b" }
+        - { Key: owner:team, Value: !Ref OwnerTeam }
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - { Key: Name, Value: !Sub "${Project}-public-rt" }
+        - { Key: owner:team, Value: !Ref OwnerTeam }
+
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  Subnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  Subnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  # Subredes privadas: sin ruta a internet (solo local y Gateway Endpoints). Estan
+  # reservadas para componentes que no deberian ser accesibles desde internet. No
+  # ponemos el servidor aca porque necesita salir a Steam y recibir UDP.
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PrivateSubnet1Cidr
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - { Key: Name, Value: !Sub "${Project}-private-a" }
+        - { Key: owner:team, Value: !Ref OwnerTeam }
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PrivateSubnet2Cidr
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - { Key: Name, Value: !Sub "${Project}-private-b" }
+        - { Key: owner:team, Value: !Ref OwnerTeam }
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - { Key: Name, Value: !Sub "${Project}-private-rt" }
+        - { Key: owner:team, Value: !Ref OwnerTeam }
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  # Gateway Endpoints: sin costo por hora. El trafico hacia S3 y DynamoDB queda
+  # dentro de la red de AWS, tanto de subredes publicas como privadas.
+  S3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
+      VpcEndpointType: Gateway
+      RouteTableIds: [!Ref PublicRouteTable, !Ref PrivateRouteTable]
+
+  DynamoDbEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.dynamodb"
+      VpcEndpointType: Gateway
+      RouteTableIds: [!Ref PublicRouteTable, !Ref PrivateRouteTable]
+
+Outputs:
+  VpcId:
+    Value: !Ref Vpc
+    Export: { Name: !Sub "${Project}-VpcId" }
+  VpcCidr:
+    Value: !Ref VpcCidr
+    Export: { Name: !Sub "${Project}-VpcCidr" }
+  PublicSubnet1:
+    Value: !Ref PublicSubnet1
+    Export: { Name: !Sub "${Project}-PublicSubnet1" }
+  PublicSubnet2:
+    Value: !Ref PublicSubnet2
+    Export: { Name: !Sub "${Project}-PublicSubnet2" }
+  PrivateSubnet1:
+    Value: !Ref PrivateSubnet1
+    Export: { Name: !Sub "${Project}-PrivateSubnet1" }
+  PrivateSubnet2:
+    Value: !Ref PrivateSubnet2
+    Export: { Name: !Sub "${Project}-PrivateSubnet2" }

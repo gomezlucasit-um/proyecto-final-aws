@@ -1,0 +1,414 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Valheim gestión de servidores, 04 servidor. Un stack para cada servidor: NLB UDP,
+  Security Group, Launch Template y ASG de mínimo 0 y máximo 1 con lifecycle hook al
+  terminar, y la alarma de inactividad. El ASG arranca en 0, o sea apagado, y se prende
+  desde el panel. Necesita los stacks 01, 02 y 03.
+
+Parameters:
+  Project:
+    Type: String
+    Default: valheim
+  ServerName:
+    Type: String
+    AllowedPattern: "^[a-z][a-z0-9-]{2,17}$"
+    ConstraintDescription: 3 a 18 caracteres, minusculas, numeros y guiones; empieza con letra.
+    Description: Nombre del servidor. Es la clave en DynamoDB y el nombre del ASG.
+  WorldName:
+    Type: String
+    Default: Midgard
+    AllowedPattern: "^[A-Za-z0-9_-]{3,20}$"
+    Description: Nombre del mundo (los archivos .db y .fwl). Si ya existe en S3 lo restaura, y si no lo crea nuevo.
+  ServerPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 5
+    MaxLength: 30
+    Description: Contraseña del servidor. Valheim pide mínimo 5 caracteres y que no esté dentro del nombre.
+  InstanceType:
+    Type: String
+    Default: t3.large
+    AllowedValues: [t3.large, t3a.large, m5.large, t3.medium]
+    Description: Recomendamos t3.large (8 GB). La t3.medium queda justa de memoria.
+  LatestAmazonLinuxAmi:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: AMI base de Amazon Linux 2023. Se ignora si ponemos una AMI nuestra.
+  CustomAmiId:
+    Type: String
+    Default: ""
+    AllowedPattern: "^(ami-[0-9a-f]+)?$"
+    Description: AMI nuestra con Docker y Valheim ya bajados, arranca en un minuto. Vacío = AMI base.
+  VolumeSizeGb:
+    Type: Number
+    Default: 20
+    MinValue: 12
+    MaxValue: 50
+  IdleMinutes:
+    Type: Number
+    Default: 30
+    MinValue: 5
+    MaxValue: 180
+    Description: Minutos seguidos sin jugadores antes de apagar.
+  InstanceProfileName:
+    Type: String
+    Default: LabInstanceProfile
+    Description: Instance profile que ya existe en la cuenta, el laboratorio de la UM no nos deja crear roles.
+  DiscordWebhook:
+    Type: String
+    Default: none
+    Description: URL del webhook de Discord para el aviso de servidor listo (o none). Es parámetro propio y no import para poder cambiarlo sin tocar el stack de control.
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90]
+    Description: Días de guardado de los logs del servidor (la consola de Valheim) en CloudWatch Logs.
+  OwnerTeam:
+    Type: String
+    Default: grupo-valheim
+
+Conditions:
+  UseCustomAmi: !Not [!Equals [!Ref CustomAmiId, ""]]
+
+Resources:
+  # ---------- Seguridad ----------
+  ServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${Project}-${ServerName}-sg"
+      GroupDescription: Valheim - UDP del juego desde internet, HTTP del health check solo desde la VPC
+      VpcId:
+        Fn::ImportValue: !Sub "${Project}-VpcId"
+      SecurityGroupIngress:
+        - IpProtocol: udp
+          FromPort: 2456
+          ToPort: 2457
+          CidrIp: 0.0.0.0/0
+          Description: Valheim juego (2456) y query (2457)
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp:
+            Fn::ImportValue: !Sub "${Project}-VpcCidr"
+          Description: status.json para el health check del NLB
+      Tags:
+        - { Key: Name, Value: !Sub "${Project}-${ServerName}-sg" }
+        - { Key: valheim:server, Value: !Ref ServerName }
+        - { Key: owner:team, Value: !Ref OwnerTeam }
+
+  # ---------- Network Load Balancer (UDP) ----------
+  GameLB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${Project}-${ServerName}-nlb"
+      Type: network
+      Scheme: internet-facing
+      IpAddressType: ipv4
+      Subnets:
+        - Fn::ImportValue: !Sub "${Project}-PublicSubnet1"
+        - Fn::ImportValue: !Sub "${Project}-PublicSubnet2"
+      LoadBalancerAttributes:
+        - { Key: load_balancing.cross_zone.enabled, Value: "true" }
+      Tags:
+        - { Key: valheim:server, Value: !Ref ServerName }
+        - { Key: owner:team, Value: !Ref OwnerTeam }
+        - { Key: owner:environment, Value: dev }
+
+  GameTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${Project}-${ServerName}-game"
+      VpcId:
+        Fn::ImportValue: !Sub "${Project}-VpcId"
+      Protocol: UDP
+      Port: 2456
+      TargetType: instance
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: "80"
+      HealthCheckPath: /status.json
+      HealthCheckIntervalSeconds: 10
+      HealthCheckTimeoutSeconds: 6
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: "30" }
+        - { Key: preserve_client_ip.enabled, Value: "true" }
+      Tags:
+        - { Key: valheim:server, Value: !Ref ServerName }
+        - { Key: owner:team, Value: !Ref OwnerTeam }
+
+  QueryTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${Project}-${ServerName}-query"
+      VpcId:
+        Fn::ImportValue: !Sub "${Project}-VpcId"
+      Protocol: UDP
+      Port: 2457
+      TargetType: instance
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: "80"
+      HealthCheckPath: /status.json
+      HealthCheckIntervalSeconds: 10
+      HealthCheckTimeoutSeconds: 6
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: "30" }
+        - { Key: preserve_client_ip.enabled, Value: "true" }
+      Tags:
+        - { Key: valheim:server, Value: !Ref ServerName }
+        - { Key: owner:team, Value: !Ref OwnerTeam }
+
+  GameListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref GameLB
+      Protocol: UDP
+      Port: 2456
+      DefaultActions:
+        - { Type: forward, TargetGroupArn: !Ref GameTargetGroup }
+
+  QueryListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref GameLB
+      Protocol: UDP
+      Port: 2457
+      DefaultActions:
+        - { Type: forward, TargetGroupArn: !Ref QueryTargetGroup }
+
+  # ---------- Logs del servidor ----------
+  # La consola de Valheim va a CloudWatch Logs con el driver awslogs de Docker. Queda
+  # aunque la instancia se termine y se ve sin entrar al servidor. Un stream por instancia.
+  ServerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/${Project}/server/${ServerName}"
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - { Key: valheim:server, Value: !Ref ServerName }
+        - { Key: owner:team, Value: !Ref OwnerTeam }
+
+  # ---------- Launch Template ----------
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${Project}-${ServerName}"
+      LaunchTemplateData:
+        ImageId: !If [UseCustomAmi, !Ref CustomAmiId, !Ref LatestAmazonLinuxAmi]
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Name: !Ref InstanceProfileName
+        SecurityGroupIds: [!Ref ServerSecurityGroup]
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: !Ref VolumeSizeGb
+              VolumeType: gp3
+              DeleteOnTermination: true
+              Encrypted: true
+        MetadataOptions:
+          HttpTokens: required
+          HttpEndpoint: enabled
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - { Key: Name, Value: !Sub "${Project}-${ServerName}" }
+              - { Key: valheim:server, Value: !Ref ServerName }
+              - { Key: owner:team, Value: !Ref OwnerTeam }
+              - { Key: owner:environment, Value: dev }
+              - { Key: cost-center, Value: facultad-aws }
+          - ResourceType: volume
+            Tags:
+              - { Key: Name, Value: !Sub "${Project}-${ServerName}" }
+              - { Key: owner:team, Value: !Ref OwnerTeam }
+        # Con la AMI base este script instala todo (3 a 5 min); con la AMI nuestra solo
+        # restaura el mundo y arranca el contenedor (1 min).
+        # Ojo con Fn::Sub: ${Nombre} lo reemplaza CloudFormation, las variables de bash
+        # van como $VAR sin llaves.
+        UserData:
+          Fn::Base64:
+            Fn::Sub:
+              - |
+                #!/bin/bash
+                set -xo pipefail
+                exec > >(tee -a /var/log/valheim-userdata.log) 2>&1
+                export AWS_DEFAULT_REGION=${AWS::Region}
+
+                # 1. Instalamos Docker, cron y jq (con la AMI nuestra ya vienen)
+                dnf install -y docker cronie jq >/dev/null
+                systemctl enable --now docker crond
+
+                # 2. Carpetas y restauracion del mundo desde S3 (va por el Gateway Endpoint)
+                mkdir -p /opt/valheim/config /opt/valheim/data
+                aws s3 sync s3://${WorldsBucket}/worlds/${ServerName}/ /opt/valheim/config/ --exclude "backups/*" --only-show-errors || true
+
+                # 3. Configuracion del contenedor, usamos la imagen lloesche/valheim-server
+                cat > /opt/valheim/valheim.env <<'EOF'
+                SERVER_NAME=${ServerName}
+                WORLD_NAME=${WorldName}
+                SERVER_PASS=${ServerPassword}
+                SERVER_PUBLIC=true
+                STATUS_HTTP=true
+                STATUS_HTTP_PORT=80
+                BACKUPS=true
+                BACKUPS_CRON=*/20 * * * *
+                BACKUPS_DIRECTORY=/config/backups
+                BACKUPS_MAX_AGE=1
+                UPDATE_CRON=
+                TZ=America/Montevideo
+                EOF
+
+                # 4. Scripts que usamos para operar
+                cat > /opt/valheim/sync.sh <<'EOF'
+                #!/bin/bash
+                # Mundo y backups van a carpetas distintas para que el lifecycle de S3 borre solo los backups viejos
+                export AWS_DEFAULT_REGION=${AWS::Region}
+                aws s3 sync /opt/valheim/config/ s3://${WorldsBucket}/worlds/${ServerName}/ --exclude "backups/*" --exclude "*.old" --only-show-errors
+                aws s3 sync /opt/valheim/config/backups/ s3://${WorldsBucket}/backups/${ServerName}/ --only-show-errors
+                EOF
+
+                cat > /opt/valheim/metric.sh <<'EOF'
+                #!/bin/bash
+                # Cada minuto manda los jugadores conectados a CloudWatch y a DynamoDB.
+                # Si no puede leer el estado del servidor no publica nada: para la alarma un dato
+                # que falta no cuenta como cero, asi un problema del contador nunca nos apaga una
+                # partida (para eso queda el apagado de seguridad de la madrugada).
+                export AWS_DEFAULT_REGION=${AWS::Region}
+                J=$(curl -sf -m 3 http://localhost/status.json 2>/dev/null)
+                P=$(echo "$J" | jq -r 'if (.error == null or .error == "") and (.player_count != null or .players != null) then (.player_count // (.players | length)) else empty end' 2>/dev/null)
+                if [ -z "$P" ]; then
+                  echo "$(date -Is) estado no disponible: $(echo "$J" | head -c 200)" >> /var/log/valheim-metric.log
+                  exit 0
+                fi
+                aws cloudwatch put-metric-data --namespace Valheim --metric-name PlayersOnline --unit Count --value $P --dimensions Server=${ServerName}
+                aws dynamodb update-item --table-name ${TableName} --key '{"PK":{"S":"SERVER#${ServerName}"},"SK":{"S":"STATE"}}' --update-expression "SET players = :p, updated = :u" --expression-attribute-values "{\":p\":{\"N\":\"$P\"},\":u\":{\"N\":\"$(date +%s)\"}}"
+                EOF
+
+                cat > /opt/valheim/ready.sh <<'EOF'
+                #!/bin/bash
+                # Espera a que el servidor acepte conexiones, lo marca RUNNING en DynamoDB y avisa por Discord
+                export AWS_DEFAULT_REGION=${AWS::Region}
+                for i in $(seq 1 90); do
+                  if docker logs valheim 2>&1 | grep -q "Game server connected"; then
+                    NOW=$(date +%s)
+                    aws dynamodb update-item --table-name ${TableName} --key '{"PK":{"S":"SERVER#${ServerName}"},"SK":{"S":"STATE"}}' --update-expression "SET #s = :s, address = :a, updated = :u, players = :z" --expression-attribute-names '{"#s":"status"}' --expression-attribute-values "{\":s\":{\"S\":\"RUNNING\"},\":a\":{\"S\":\"${GameLB.DNSName}\"},\":u\":{\"N\":\"$NOW\"},\":z\":{\"N\":\"0\"}}"
+                    aws dynamodb put-item --table-name ${TableName} --item "{\"PK\":{\"S\":\"SERVER#${ServerName}\"},\"SK\":{\"S\":\"EVENT#$(date +%s%3N)\"},\"kind\":{\"S\":\"running\"},\"detail\":{\"S\":\"servidor listo en ${GameLB.DNSName}:2456\"},\"ts\":{\"N\":\"$NOW\"}}"
+                    if [ "${Webhook}" != "none" ]; then
+                      curl -sf -m 5 -H 'Content-Type: application/json' -d "{\"content\":\"[${ServerName}] servidor listo, conectarse a ${GameLB.DNSName}:2456 (mundo ${WorldName}).\"}" "${Webhook}" >/dev/null
+                    fi
+                    exit 0
+                  fi
+                  sleep 10
+                done
+                echo "el servidor no respondio en 15 minutos"
+                EOF
+
+                cat > /opt/valheim/shutdown.sh <<'EOF'
+                #!/bin/bash
+                # Uso: shutdown.sh <hook> <asg> <token>. Lo corre la Lambda graceful-shutdown por SSM Run Command.
+                # Para el contenedor (Valheim guarda el mundo al recibir SIGTERM), sube todo a S3 y libera el hook.
+                export AWS_DEFAULT_REGION=${AWS::Region}
+                docker stop -t 120 valheim || true
+                /opt/valheim/sync.sh
+                aws cloudwatch put-metric-data --namespace Valheim --metric-name PlayersOnline --unit Count --value 0 --dimensions Server=${ServerName}
+                if [ -n "$3" ]; then
+                  aws autoscaling complete-lifecycle-action --lifecycle-hook-name "$1" --auto-scaling-group-name "$2" --lifecycle-action-token "$3" --lifecycle-action-result CONTINUE
+                fi
+                EOF
+                chmod +x /opt/valheim/*.sh
+
+                cat > /etc/cron.d/valheim <<'EOF'
+                * * * * * root /opt/valheim/metric.sh >/dev/null 2>&1
+                5,25,45 * * * * root /opt/valheim/sync.sh >/dev/null 2>&1
+                EOF
+                systemctl restart crond
+
+                # 5. Arranque del servidor
+                docker pull lloesche/valheim-server:latest >/dev/null 2>&1 || true
+                docker rm -f valheim >/dev/null 2>&1 || true
+                IID=$(curl -s -m 3 -H "X-aws-ec2-metadata-token: $(curl -s -m 3 -X PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 60')" http://169.254.169.254/latest/meta-data/instance-id || hostname)
+                docker run -d --name valheim --restart unless-stopped --cap-add=sys_nice --stop-timeout 120 \
+                  --log-driver awslogs --log-opt awslogs-region=${AWS::Region} --log-opt awslogs-group=${ServerLogGroup} --log-opt awslogs-stream=$IID \
+                  -p 2456-2457:2456-2457/udp -p 80:80/tcp \
+                  -v /opt/valheim/config:/config -v /opt/valheim/data:/opt/valheim \
+                  --env-file /opt/valheim/valheim.env lloesche/valheim-server:latest
+
+                # Arrancamos la alarma en OK para que no quede pegada en ALARM de un apagado anterior
+                aws cloudwatch set-alarm-state --alarm-name ${Project}-${ServerName}-idle --state-value OK --state-reason "servidor arrancando" || true
+                nohup /opt/valheim/ready.sh >/var/log/valheim-ready.log 2>&1 &
+              - WorldsBucket:
+                  Fn::ImportValue: !Sub "${Project}-WorldsBucket"
+                TableName:
+                  Fn::ImportValue: !Sub "${Project}-TableName"
+                Webhook: !Ref DiscordWebhook
+
+  # ---------- Auto Scaling Group: el "interruptor" ----------
+  ServerAsg:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub "${Project}-${ServerName}"
+      MinSize: "0"
+      MaxSize: "1"
+      DesiredCapacity: "0"
+      Cooldown: "60"
+      HealthCheckType: EC2
+      HealthCheckGracePeriod: 300
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      VPCZoneIdentifier:
+        - Fn::ImportValue: !Sub "${Project}-PublicSubnet1"
+        - Fn::ImportValue: !Sub "${Project}-PublicSubnet2"
+      TargetGroupARNs:
+        - !Ref GameTargetGroup
+        - !Ref QueryTargetGroup
+      # Al apagarse, la instancia queda en Terminating:Wait hasta 5 minutos para que
+      # graceful-shutdown guarde el mundo. Si nadie completa el hook, sigue igual.
+      LifecycleHookSpecificationList:
+        - LifecycleHookName: !Sub "${Project}-graceful-shutdown"
+          LifecycleTransition: autoscaling:EC2_INSTANCE_TERMINATING
+          HeartbeatTimeout: 300
+          DefaultResult: CONTINUE
+      # Metricas del grupo (son gratis) para el dashboard
+      MetricsCollection:
+        - Granularity: 1Minute
+          Metrics: [GroupInServiceInstances, GroupDesiredCapacity]
+      Tags:
+        - { Key: Name, Value: !Sub "${Project}-${ServerName}", PropagateAtLaunch: true }
+        - { Key: valheim:server, Value: !Ref ServerName, PropagateAtLaunch: true }
+        - { Key: valheim:world, Value: !Ref WorldName, PropagateAtLaunch: true }
+        - { Key: owner:team, Value: !Ref OwnerTeam, PropagateAtLaunch: true }
+        - { Key: owner:environment, Value: dev, PropagateAtLaunch: true }
+        - { Key: cost-center, Value: facultad-aws, PropagateAtLaunch: true }
+
+  # ---------- Apagado por inactividad ----------
+  IdleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${Project}-${ServerName}-idle"
+      AlarmDescription: !Sub "Valheim ${ServerName}: ${IdleMinutes} minutos sin jugadores, EventBridge llama a idle-stop para apagarlo."
+      Namespace: Valheim
+      MetricName: PlayersOnline
+      Dimensions:
+        - { Name: Server, Value: !Ref ServerName }
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: !Ref IdleMinutes
+      DatapointsToAlarm: !Ref IdleMinutes
+      Threshold: 0
+      ComparisonOperator: LessThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
+  ServerAddress:
+    Description: Dirección que ponen los jugadores en Unirse por IP (ya con el puerto 2456).
+    Value: !Sub "${GameLB.DNSName}:2456"
+  AsgName:
+    Value: !Ref ServerAsg
+  AlarmName:
+    Value: !Ref IdleAlarm
+  ForceIdleStop:
+    Description: Comando para forzar el apagado por inactividad en la demo.
+    Value: !Sub "aws cloudwatch set-alarm-state --alarm-name ${IdleAlarm} --state-value ALARM --state-reason demo"
